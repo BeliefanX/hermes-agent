@@ -6766,42 +6766,6 @@ class AIAgent:
             cache[mode] = t
         return t
 
-    @staticmethod
-    def _nr_to_assistant_message(nr):
-        """Convert a NormalizedResponse to the SimpleNamespace shape downstream expects.
-
-        This is the single back-compat shim between the transport layer
-        (NormalizedResponse) and the agent loop (SimpleNamespace with
-        .content, .tool_calls, .reasoning, .reasoning_content,
-        .reasoning_details, .codex_reasoning_items, and per-tool-call
-        .call_id / .response_item_id).
-
-        TODO: Remove when downstream code reads NormalizedResponse directly.
-        """
-        tc_list = None
-        if nr.tool_calls:
-            tc_list = []
-            for tc in nr.tool_calls:
-                tc_ns = SimpleNamespace(
-                    id=tc.id,
-                    type="function",
-                    function=SimpleNamespace(name=tc.name, arguments=tc.arguments),
-                )
-                if tc.provider_data:
-                    for key in ("call_id", "response_item_id"):
-                        if tc.provider_data.get(key):
-                            setattr(tc_ns, key, tc.provider_data[key])
-                tc_list.append(tc_ns)
-        pd = nr.provider_data or {}
-        return SimpleNamespace(
-            content=nr.content,
-            tool_calls=tc_list or None,
-            reasoning=nr.reasoning,
-            reasoning_content=pd.get("reasoning_content"),
-            reasoning_details=pd.get("reasoning_details"),
-            codex_reasoning_items=pd.get("codex_reasoning_items"),
-        )
-
     def _prepare_anthropic_messages_for_api(self, api_messages: list) -> list:
         if not any(
             isinstance(msg, dict) and self._content_has_image_parts(msg.get("content"))
@@ -7511,12 +7475,17 @@ class AIAgent:
                             function=SimpleNamespace(name=tc.name, arguments=tc.arguments),
                         ) for tc in _flush_nr.tool_calls
                     ]
-            elif hasattr(response, "choices") and response.choices:
+            elif self.api_mode in ("chat_completions", "bedrock_converse"):
                 # chat_completions / bedrock — normalize through transport
                 _flush_cc_nr = self._get_transport().normalize_response(response)
-                _flush_msg = self._nr_to_assistant_message(_flush_cc_nr)
-                if _flush_msg.tool_calls:
-                    tool_calls = _flush_msg.tool_calls
+                if _flush_cc_nr.tool_calls:
+                    tool_calls = _flush_cc_nr.tool_calls
+            elif _aux_available and hasattr(response, "choices") and response.choices:
+                # Auxiliary client returned OpenAI-shaped response while main
+                # api_mode is codex/anthropic — extract tool_calls from .choices
+                _aux_msg = response.choices[0].message
+                if hasattr(_aux_msg, "tool_calls") and _aux_msg.tool_calls:
+                    tool_calls = _aux_msg.tool_calls
 
             for tc in tool_calls:
                 if tc.function.name == "memory":
@@ -9663,7 +9632,7 @@ class AIAgent:
                         _cc_fr = self._get_transport()
                         _cc_fr_nr = _cc_fr.normalize_response(response)
                         finish_reason = _cc_fr_nr.finish_reason
-                        assistant_message = self._nr_to_assistant_message(_cc_fr_nr)
+                        assistant_message = _cc_fr_nr
                         if self._should_treat_stop_as_truncated(
                             finish_reason,
                             assistant_message,
@@ -9693,7 +9662,7 @@ class AIAgent:
                             )
                         else:
                             _trunc_nr = _trunc_transport.normalize_response(response)
-                        _trunc_msg = self._nr_to_assistant_message(_trunc_nr)
+                        _trunc_msg = _trunc_nr
 
                         _trunc_content = getattr(_trunc_msg, "content", None) if _trunc_msg else None
                         _trunc_has_tool_calls = bool(getattr(_trunc_msg, "tool_calls", None)) if _trunc_msg else False
@@ -10929,7 +10898,7 @@ class AIAgent:
                 if self.api_mode == "anthropic_messages":
                     _normalize_kwargs["strip_tool_prefix"] = self._is_anthropic_oauth
                 _nr = _transport.normalize_response(response, **_normalize_kwargs)
-                assistant_message = self._nr_to_assistant_message(_nr)
+                assistant_message = _nr
                 finish_reason = _nr.finish_reason
                 
                 # Normalize content to string — some OpenAI-compatible servers
